@@ -1,107 +1,88 @@
-"""
-FastAPI inference service for loan default prediction.
-Provides real-time predictions with explainability and monitoring.
-"""
+from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
-import uvicorn
 import logging
 import time
 import uuid
-from typing import Dict, List, Optional
-import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import joblib
 import mlflow
-from prometheus_client import Counter, Histogram, Gauge, generate_latest
+import pandas as pd
 import redis
-from pydantic import BaseModel, Field
+import uvicorn
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import generate_latest
 
-from .schemas import LoanApplicationRequest, PredictionResponse, ExplanationResponse
-from .middleware.auth import authenticate_request
-from .middleware.logging import RequestLoggingMiddleware
-from .middleware.rate_limit import RateLimitMiddleware
-from ..utils.config import get_config
-from ..monitoring.metrics import (
-    prediction_counter, 
-    prediction_latency, 
-    model_accuracy_gauge,
-    active_connections_gauge
+from src.api.middleware.auth import authenticate_request
+from src.api.middleware.logging import RequestLoggingMiddleware
+from src.api.middleware.rate_limit import RateLimitMiddleware
+from src.api.schemas import (
+    BatchPredictionRequest,
+    ExplanationResponse,
+    LoanApplicationRequest,
+    PredictionResponse,
 )
+from src.monitoring.metrics import (
+    active_connections_gauge,
+    prediction_counter,
+    prediction_latency,
+    registry,
+)
+from src.utils.config import get_config
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Global variables
+config = get_config()
 model = None
 preprocessor = None
 redis_client = None
-config = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
-    # Startup
-    global model, preprocessor, redis_client, config
-    
-    logger.info("Starting up inference service...")
-    
-    # Load configuration
-    config = get_config()
-    
-    # Load model and preprocessor
-    try:
-        model = joblib.load(config.model.path)
-        preprocessor = joblib.load(config.preprocessor.path)
-        logger.info("Model and preprocessor loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
-    
-    # Initialize Redis
+    global model, preprocessor, redis_client
+
+    model_path = Path(config.model.path)
+    preproc_path = Path(config.model.preprocessor_path)
+
+    if model_path.exists() and preproc_path.exists():
+        model = joblib.load(model_path)
+        preprocessor = joblib.load(preproc_path)
+        logger.info("Loaded model artifacts")
+    else:
+        logger.warning("Model artifacts not found at %s and %s", model_path, preproc_path)
+
     try:
         redis_client = redis.Redis(
             host=config.redis.host,
             port=config.redis.port,
             db=config.redis.db,
-            decode_responses=True
+            decode_responses=True,
         )
         redis_client.ping()
-        logger.info("Redis connection established")
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
+    except Exception as exc:
+        logger.warning("Redis unavailable: %s", exc)
         redis_client = None
-    
-    # Setup MLflow
+
     mlflow.set_tracking_uri(config.mlflow.tracking_uri)
-    
-    logger.info("Service startup complete")
-    
+
     yield
-    
-    # Shutdown
-    logger.info("Shutting down inference service...")
-    if redis_client:
+
+    if redis_client is not None:
         redis_client.close()
 
-# Create FastAPI app
+
 app = FastAPI(
     title="Loan Default Prediction API",
-    description="Production-grade API for loan default risk assessment with explainability",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    lifespan=lifespan
+    version="0.1.0",
+    lifespan=lifespan,
 )
 
-# Add middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.cors.allowed_origins,
@@ -113,270 +94,184 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
-# Metrics endpoints
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint."""
-    if not config.monitoring.enabled:
-        raise HTTPException(status_code=404, detail="Metrics not enabled")
-    return generate_latest()
+
+@app.middleware("http")
+async def track_active_connections(request, call_next):
+    active_connections_gauge.inc()
+    try:
+        return await call_next(request)
+    finally:
+        active_connections_gauge.dec()
+
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    health_status = {
-        "status": "healthy",
+    redis_ok = False
+    if redis_client is not None:
+        try:
+            redis_ok = bool(redis_client.ping())
+        except Exception:
+            redis_ok = False
+
+    healthy = model is not None and preprocessor is not None
+    payload = {
+        "status": "healthy" if healthy else "degraded",
         "timestamp": time.time(),
         "model_loaded": model is not None,
         "preprocessor_loaded": preprocessor is not None,
-        "redis_connected": redis_client is not None and redis_client.ping()
+        "redis_connected": redis_ok,
     }
-    
-    # Check if all components are healthy
-    if all(health_status.values()):
-        return JSONResponse(status_code=200, content=health_status)
-    else:
-        return JSONResponse(status_code=503, content=health_status)
+    return JSONResponse(status_code=200, content=payload)
+
+
+@app.get("/metrics")
+async def metrics():
+    if not config.monitoring.enabled:
+        raise HTTPException(status_code=404, detail="Metrics not enabled")
+    return Response(content=generate_latest(registry), media_type="text/plain; version=0.0.4")
+
+
+def _risk_category(default_probability: float) -> str:
+    if default_probability < 0.2:
+        return "Low"
+    if default_probability < 0.5:
+        return "Medium"
+    return "High"
+
+
+def _ensure_model_ready() -> None:
+    if model is None or preprocessor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(
     request: LoanApplicationRequest,
     background_tasks: BackgroundTasks,
-    authenticated: bool = Depends(authenticate_request)
+    authenticated: bool = Depends(authenticate_request),
 ):
-    """
-    Predict loan default probability.
-    
-    Args:
-        request: Loan application data
-        background_tasks: Background tasks for async operations
-        authenticated: Authentication status from middleware
-        
-    Returns:
-        Prediction response with probability and risk category
-    """
-    start_time = time.time()
+    del authenticated
+    _ensure_model_ready()
+    start_time = time.perf_counter()
     request_id = str(uuid.uuid4())
-    
+
     try:
-        # Log prediction request
-        logger.info(f"Prediction request {request_id}: {request.loan_id}")
-        
-        # Check cache first
-        cache_key = f"prediction:{hash(str(request.dict()))}"
-        if redis_client:
-            cached_result = redis_client.get(cache_key)
-            if cached_result:
-                logger.info(f"Cache hit for request {request_id}")
-                prediction_counter.labels(cache_hit="true").inc()
-                return PredictionResponse.parse_raw(cached_result)
-        
-        # Convert to DataFrame
-        input_data = pd.DataFrame([request.dict()])
-        
-        # Preprocess
-        processed_data = preprocessor.transform(input_data)
-        
-        # Make prediction
-        prediction_proba = model.predict_proba(processed_data)[0]
-        default_probability = float(prediction_proba[1])
-        
-        # Determine risk category
-        if default_probability < 0.2:
-            risk_category = "Low"
-        elif default_probability < 0.5:
-            risk_category = "Medium"
-        else:
-            risk_category = "High"
-        
-        # Create response
+        cache_key = f"prediction:{hash(request.model_dump_json())}"
+        if redis_client is not None:
+            cached = redis_client.get(cache_key)
+            if cached:
+                cached_resp = PredictionResponse.model_validate_json(cached)
+                prediction_counter.labels(
+                    risk_category=cached_resp.risk_category,
+                    cache_hit="true",
+                    model_version=cached_resp.model_version,
+                ).inc()
+                return cached_resp
+
+        input_df = pd.DataFrame([request.model_dump()])
+        processed = preprocessor.transform(input_df)
+        proba = float(model.predict_proba(processed)[0][1])
+        risk = _risk_category(proba)
+
         response = PredictionResponse(
             loan_id=request.loan_id,
-            default_probability=default_probability,
-            risk_category=risk_category,
+            default_probability=proba,
+            risk_category=risk,
             prediction_timestamp=time.time(),
-            model_version=config.model.version
+            model_version=config.model.version,
         )
-        
-        # Cache result
-        if redis_client:
-            redis_client.setex(
-                cache_key, 
-                config.redis.ttl, 
-                response.json()
-            )
-        
-        # Log prediction
+
+        if redis_client is not None:
+            redis_client.setex(cache_key, config.redis.ttl, response.model_dump_json())
+
         prediction_counter.labels(
-            risk_category=risk_category,
-            cache_hit="false"
+            risk_category=risk,
+            cache_hit="false",
+            model_version=config.model.version,
         ).inc()
-        
-        # Background task for monitoring
-        background_tasks.add_task(
-            log_prediction_async,
-            request_id,
-            request.dict(),
-            response.dict()
-        )
-        
-        # Record latency
-        latency = time.time() - start_time
-        prediction_latency.observe(latency)
-        
-        logger.info(f"Prediction {request_id} completed in {latency:.3f}s")
-        
+        prediction_latency.observe(time.perf_counter() - start_time)
+
+        background_tasks.add_task(log_prediction_async, request_id, request.model_dump(), response.model_dump())
         return response
-        
-    except Exception as e:
-        logger.error(f"Prediction failed for request {request_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
+
+
+@app.post("/predict/batch", response_model=list[PredictionResponse])
+async def predict_batch(
+    request: BatchPredictionRequest,
+    authenticated: bool = Depends(authenticate_request),
+):
+    del authenticated
+    _ensure_model_ready()
+
+    if len(request.applications) > config.batch.max_size:
+        raise HTTPException(status_code=400, detail=f"Batch size exceeds maximum of {config.batch.max_size}")
+
+    df = pd.DataFrame([app.model_dump() for app in request.applications])
+    processed = preprocessor.transform(df)
+    probas = model.predict_proba(processed)
+
+    out = []
+    for app_data, pred in zip(request.applications, probas):
+        p_default = float(pred[1])
+        out.append(
+            PredictionResponse(
+                loan_id=app_data.loan_id,
+                default_probability=p_default,
+                risk_category=_risk_category(p_default),
+                prediction_timestamp=time.time(),
+                model_version=config.model.version,
+            )
+        )
+    return out
+
 
 @app.post("/explain", response_model=ExplanationResponse)
 async def explain(
     request: LoanApplicationRequest,
-    authenticated: bool = Depends(authenticate_request)
+    authenticated: bool = Depends(authenticate_request),
 ):
-    """
-    Generate model explanation using SHAP values.
-    
-    Args:
-        request: Loan application data
-        authenticated: Authentication status
-        
-    Returns:
-        Explanation response with feature contributions
-    """
+    del authenticated
+    _ensure_model_ready()
+
     try:
         import shap
-        
-        # Convert to DataFrame
-        input_data = pd.DataFrame([request.dict()])
-        
-        # Preprocess
-        processed_data = preprocessor.transform(input_data)
-        
-        # Get feature names
+
+        input_df = pd.DataFrame([request.model_dump()])
+        processed = preprocessor.transform(input_df)
         feature_names = preprocessor.get_feature_names_out()
-        
-        # Create SHAP explainer
+
         explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(processed_data)
-        
-        # Get feature contributions
-        contributions = {}
-        for i, (name, value) in enumerate(zip(feature_names, shap_values[0])):
-            contributions[name] = float(value)
-        
-        # Sort by absolute contribution
-        sorted_contributions = dict(
-            sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)
-        )
-        
-        # Create explanation
-        explanation = ExplanationResponse(
+        shap_values = explainer.shap_values(processed)
+        values = shap_values[0] if hasattr(shap_values, "__len__") else shap_values
+
+        contributions = {
+            name: float(val)
+            for name, val in zip(feature_names, values)
+        }
+
+        return ExplanationResponse(
             loan_id=request.loan_id,
-            feature_contributions=sorted_contributions,
-            base_value=float(explainer.expected_value),
+            feature_contributions=dict(sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)),
+            base_value=float(getattr(explainer, "expected_value", 0.0)),
             explanation_timestamp=time.time(),
-            model_version=config.model.version
+            model_version=config.model.version,
         )
-        
-        return explanation
-        
-    except Exception as e:
-        logger.error(f"Explanation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Explanation failed: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Explanation failed: {exc}") from exc
 
-@app.post("/predict/batch")
-async def predict_batch(
-    requests: List[LoanApplicationRequest],
-    authenticated: bool = Depends(authenticate_request)
-):
-    """
-    Batch prediction endpoint for multiple loan applications.
-    
-    Args:
-        requests: List of loan applications
-        authenticated: Authentication status
-        
-    Returns:
-        List of prediction responses
-    """
-    try:
-        if len(requests) > config.batch.max_size:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Batch size exceeds maximum of {config.batch.max_size}"
-            )
-        
-        # Convert to DataFrame
-        input_data = pd.DataFrame([req.dict() for req in requests])
-        
-        # Preprocess
-        processed_data = preprocessor.transform(input_data)
-        
-        # Make predictions
-        prediction_probas = model.predict_proba(processed_data)
-        
-        # Create responses
-        responses = []
-        for i, request in enumerate(requests):
-            default_probability = float(prediction_probas[i, 1])
-            
-            if default_probability < 0.2:
-                risk_category = "Low"
-            elif default_probability < 0.5:
-                risk_category = "Medium"
-            else:
-                risk_category = "High"
-            
-            response = PredictionResponse(
-                loan_id=request.loan_id,
-                default_probability=default_probability,
-                risk_category=risk_category,
-                prediction_timestamp=time.time(),
-                model_version=config.model.version
-            )
-            responses.append(response)
-        
-        logger.info(f"Batch prediction completed for {len(requests)} applications")
-        
-        return responses
-        
-    except Exception as e:
-        logger.error(f"Batch prediction failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
 
-async def log_prediction_async(request_id: str, input_data: Dict, output_data: Dict):
-    """Background task to log predictions for monitoring."""
+async def log_prediction_async(request_id: str, input_data: dict, output_data: dict) -> None:
     try:
-        # Log to MLflow
         with mlflow.start_run(run_name=f"prediction_{request_id}"):
             mlflow.log_params(input_data)
-            mlflow.log_metrics(output_data)
-        
-        # Log to database or monitoring system
-        # This would integrate with your monitoring infrastructure
-        
-    except Exception as e:
-        logger.error(f"Failed to log prediction {request_id}: {str(e)}")
+            mlflow.log_metric("default_probability", float(output_data.get("default_probability", 0.0)))
+    except Exception as exc:
+        logger.warning("Failed to log prediction %s: %s", request_id, exc)
 
-# Update active connections
-@app.middleware("http")
-async def update_active_connections(request, call_next):
-    active_connections_gauge.inc()
-    try:
-        response = await call_next(request)
-        return response
-    finally:
-        active_connections_gauge.dec()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    uvicorn.run("src.api.main:app", host="0.0.0.0", port=8000, reload=True)

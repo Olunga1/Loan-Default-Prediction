@@ -1,0 +1,2 @@
+- data.train_path=sample_data.csv
+- model.output_dir=models

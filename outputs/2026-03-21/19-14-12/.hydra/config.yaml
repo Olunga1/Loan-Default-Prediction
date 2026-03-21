@@ -1,0 +1,23 @@
+random_state: 42
+validation_split: 0.2
+cv_folds: 5
+data:
+  train_path: sample_data.csv
+  test_path: data/raw/test.csv
+  validation_rules:
+    min_age: 18
+    max_loan_amount: 1000000
+    min_income: 15000
+model:
+  type: xgboost
+  output_dir: models
+optuna:
+  n_trials: 100
+  timeout: 3600
+mlflow:
+  tracking_uri: file:///./mlruns
+  experiment_name: loan-default-prediction
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file: logs/training.log

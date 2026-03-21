@@ -1,0 +1,2 @@
+[2026-03-21 19:14:12,874][src.data.ingestion][INFO] - Loaded 1000 rows from sample_data.csv
+[2026-03-21 19:14:16,514][__main__][INFO] - Validation AUC: 0.4521

@@ -71,13 +71,13 @@ class TestPredictionEndpoint:
             "loan_id": "HIGH_RISK_001",
             "age": 22,
             "income": 20000,
-            "loan_amount": 500000,
+            "loan_amount": 180000,
             "credit_score": 400,
             "months_employed": 6,
             "num_credit_lines": 8,
             "interest_rate": 15.0,
             "loan_term": 360,
-            "dti_ratio": 0.85,
+            "dti_ratio": 0.7,
             "education": "High School",
             "employment_type": "Unemployed",
             "marital_status": "Single",
@@ -235,7 +235,7 @@ class TestBatchPrediction:
         batch_data = {"applications": applications}
         
         response = client.post("/predict/batch", json=batch_data)
-        assert response.status_code == 400
+        assert response.status_code == 422
 
 class TestHealthEndpoint:
     """Test cases for health check endpoint."""
